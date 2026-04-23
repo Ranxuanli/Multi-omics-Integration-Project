@@ -77,7 +77,15 @@ Batch correction substantially reduced study-specific variation:
 
 **PERMANOVA R²: 0.2289 → 0.1273**
 
+## PCoA Before and After Batch Correction
+
+![PCoA Batch Correction](figures/pcoa_before_after.png)
+
 Several biologically meaningful pathways were identified as significantly associated with treatment response.
+
+## Significant Pathways from Meta-analysis
+
+![Pathway Analysis](figures/pathway_meta_analysis.png)
 
 ---
 
