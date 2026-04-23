@@ -133,6 +133,10 @@ Methods:
 
 Raw feature late integration remained superior:
 
+## Raw Features vs MOFA Factors
+
+![MOFA Comparison](figures/mofa_comparison.png)
+
 * Raw features (Late): **MSPE = 619.62**
 * MOFA factors (Late): **MSPE = 1121.19**
 
