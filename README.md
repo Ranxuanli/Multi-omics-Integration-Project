@@ -37,6 +37,9 @@ Late integration using `IntegratedLearner` achieved the best predictive performa
 
 **MSPE = 619.62**
 
+## Performance Comparison Across Integration Methods
+
+![MSPE Comparison](figures/mspe_comparison.png)
 This suggests that model-level integration outperforms direct feature concatenation for this prediction task.
 
 ---
