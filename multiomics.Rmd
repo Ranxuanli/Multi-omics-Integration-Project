@@ -1,0 +1,960 @@
+---
+title: "multiomics"
+author: "Ranxuan Li"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    df_print: paged
+  pdf_document:
+    toc: true
+    number_sections: true
+    latex_engine: xelatex
+fontsize: 11pt
+geometry: margin=1in
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 8,
+  fig.height = 5,
+  dpi = 300
+)
+```
+
+# Setup
+
+```{r}
+library(tidyverse)
+library(cowplot)
+library(caret)
+library(ROCR)
+library(vegan)
+library(SuperLearner)
+library(bartMachine)
+library(bartMachineJARs)
+library(IntegratedLearner)
+library(BayesCOOP)
+library(multiview)
+library(curatedMetagenomicData)
+library(Maaslin2)
+library(MMUPHin)
+library(MOFA2)
+library(jafar)
+library(lme4)
+
+set.seed(123)
+theme_set(theme_bw())
+options(java.parameters = "-Xmx8000m")
+```
+
+# Reuse preprocessing from Lab 5
+
+```{r}
+base_url <- paste0(
+  "https://raw.githubusercontent.com/",
+  "himelmallick/IntegratedLearner/master/data/"
+)
+
+data_train <- get(load(url(paste0(base_url, "StelzerDOS.RData"))))
+data_test  <- get(load(url(paste0(base_url, "StelzerDOS_valid.RData"))))
+
+ndata_train <- data_train
+ndata_train$feature_metadata <- ndata_train$feature_metadata %>%
+  dplyr::filter(featureType != "Metabolomics")
+ndata_train$feature_table <- ndata_train$feature_table[
+  rownames(ndata_train$feature_metadata), , drop = FALSE
+]
+
+pos_train <- grep("A", colnames(ndata_train$feature_table), ignore.case = TRUE)
+ndata_train$feature_table   <- ndata_train$feature_table[, pos_train, drop = FALSE]
+ndata_train$sample_metadata <- ndata_train$sample_metadata[pos_train, , drop = FALSE]
+
+pos_test <- grep("G1", colnames(data_test$feature_table))
+data_test$feature_table   <- data_test$feature_table[, pos_test, drop = FALSE]
+data_test$sample_metadata <- data_test$sample_metadata[pos_test, , drop = FALSE]
+
+gen_datalist_il <- function(dat) {
+  views <- unique(dat$feature_metadata$featureType)
+  xList <- lapply(views, function(v) {
+    feats <- rownames(dat$feature_metadata)[dat$feature_metadata$featureType == v]
+    as.data.frame(t(dat$feature_table[feats, , drop = FALSE]))
+  })
+  names(xList) <- views
+  y <- dat$sample_metadata[, 1]
+  if (is.data.frame(y)) y <- y[[1]]
+  list(xList = xList, y = y)
+}
+
+filter_features_il <- function(x, abd_thresh = 0, prev_thresh = 0.1) {
+  keep <- colSums(x > abd_thresh) > nrow(x) * prev_thresh
+  x <- x[, keep, drop = FALSE]
+  nzv <- caret::nearZeroVar(x)
+  if (length(nzv) > 0) x <- x[, -nzv, drop = FALSE]
+  x
+}
+
+reconstruct_data_IL <- function(xList, y) {
+  ft <- as.data.frame(do.call(rbind, lapply(xList, function(x) t(as.data.frame(x)))))
+  fmeta <- data.frame(
+    featureID = rownames(ft),
+    featureType = rep(names(xList), sapply(xList, ncol)),
+    stringsAsFactors = FALSE
+  )
+  rownames(fmeta) <- fmeta$featureID
+  smeta <- data.frame(
+    Y = as.numeric(y),
+    subjectID = colnames(ft),
+    stringsAsFactors = FALSE
+  )
+  rownames(smeta) <- smeta$subjectID
+  list(feature_table = ft, feature_metadata = fmeta, sample_metadata = smeta)
+}
+
+dl_train_il <- gen_datalist_il(ndata_train)
+dl_test_il  <- gen_datalist_il(data_test)
+
+xList_train <- lapply(dl_train_il$xList, filter_features_il)
+xList_test  <- lapply(dl_test_il$xList, filter_features_il)
+y_train <- dl_train_il$y
+y_test  <- dl_test_il$y
+
+keep_features <- vector("list", length(xList_train))
+for (i in seq_along(xList_train)) {
+  keep_features[[i]] <- intersect(colnames(xList_train[[i]]), colnames(xList_test[[i]]))
+  xList_train[[i]] <- as.matrix(xList_train[[i]][, keep_features[[i]], drop = FALSE])
+  xList_test[[i]]  <- as.matrix(xList_test[[i]][, keep_features[[i]], drop = FALSE])
+}
+
+data_train_processed <- reconstruct_data_IL(xList_train, y_train)
+data_test_processed  <- reconstruct_data_IL(xList_test,  y_test)
+
+feature_lookup <- bind_rows(lapply(names(xList_train), function(v) {
+  tibble(feature = colnames(xList_train[[v]]), view = v)
+}))
+
+dl_train_bc <- BayesCOOP:::gen_datalist(ndata_train)
+dl_test_bc  <- BayesCOOP:::gen_datalist(data_test)
+
+xList_train_bc <- lapply(dl_train_bc$xList, function(x) BayesCOOP:::filter_features(x, 0, 0.1))
+xList_test_bc  <- lapply(dl_test_bc$xList,  function(x) BayesCOOP:::filter_features(x, 0, 0.1))
+y_train_bc <- dl_train_bc$y
+y_test_bc  <- dl_test_bc$y
+
+keep_features_bc <- vector("list", length(xList_train_bc))
+for (i in seq_along(xList_train_bc)) {
+  keep_features_bc[[i]] <- intersect(colnames(xList_train_bc[[i]]), colnames(xList_test_bc[[i]]))
+  xList_train_bc[[i]] <- as.matrix(xList_train_bc[[i]][, keep_features_bc[[i]], drop = FALSE])
+  xList_test_bc[[i]]  <- as.matrix(xList_test_bc[[i]][, keep_features_bc[[i]], drop = FALSE])
+}
+
+data_train_bc <- BayesCOOP:::reconstruct_data(xList_train_bc, y_train_bc)
+data_test_bc  <- BayesCOOP:::reconstruct_data(xList_test_bc,  y_test_bc)
+```
+
+# Problem 1: Vertical Integration of Pregnancy Data
+
+## Baseline IntegratedLearner results from lab
+
+```{r}
+fit_IL <- IntegratedLearner(
+  PCL_train = data_train_processed,
+  PCL_valid = data_test_processed,
+  folds = 5,
+  seed = 123,
+  base_learner = "SL.randomForest",
+  base_screener = "All",
+  meta_learner = "SL.nnls.auc",
+  run_concat = TRUE,
+  run_stacked = TRUE,
+  verbose = FALSE,
+  print_learner = TRUE,
+  refit.stack = TRUE,
+  family = gaussian()
+)
+
+mspe_IL_early <- mean((fit_IL$yhat.test$concatenated - y_test)^2, na.rm = TRUE)
+mspe_IL_late  <- mean((fit_IL$yhat.test$stacked - y_test)^2, na.rm = TRUE)
+```
+
+## 1(a) Cooperative learning with `multiview`
+
+```{r}
+cvfit_mv <- multiview::cv.multiview(
+  x_list = xList_train,
+  y = y_train,
+  family = gaussian(),
+  rho = 0.5,
+  alpha = 1,
+  nfolds = 5,
+  type.measure = "mse"
+)
+
+best_lambda <- cvfit_mv$lambda.min
+
+fit_mv <- multiview::multiview(
+  x_list = xList_train,
+  y = y_train,
+  family = gaussian(),
+  rho = 0.5,
+  alpha = 1,
+  lambda = best_lambda
+)
+
+coef_mv <- as.matrix(multiview:::coef.multiview(fit_mv, s = best_lambda))
+beta_vec <- coef_mv[, 1]
+intercept_mv <- beta_vec[1]
+beta_no_intercept <- beta_vec[-1]
+names(beta_no_intercept) <- rownames(coef_mv)[-1]
+
+Xtest_concat <- do.call(cbind, xList_test)
+common_feats <- intersect(colnames(Xtest_concat), names(beta_no_intercept))
+Xtest_use <- Xtest_concat[, common_feats, drop = FALSE]
+beta_use <- beta_no_intercept[common_feats]
+
+yhat_mv <- as.numeric(intercept_mv + as.matrix(Xtest_use) %*% beta_use)
+mspe_mv <- mean((yhat_mv - y_test)^2, na.rm = TRUE)
+
+coef_mv_df <- tibble(
+  feature = names(beta_no_intercept),
+  beta = as.numeric(beta_no_intercept)
+) %>%
+  filter(beta != 0) %>%
+  left_join(feature_lookup, by = "feature") %>%
+  arrange(beta)
+
+n_nonzero_mv <- nrow(coef_mv_df)
+
+knitr::kable(
+  tibble(Method = "multiview (Intermediate)", MSPE = mspe_mv, Nonzero = n_nonzero_mv),
+  digits = 4
+)
+```
+
+```{r}
+ggplot(coef_mv_df, aes(x = reorder(feature, beta), y = beta, fill = view)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "multiview nonzero coefficients",
+    x = NULL,
+    y = "Coefficient"
+  )
+```
+
+## 1(b) BayesCOOP with Bayesian bootstrap
+
+```{r}
+fit_bc <- BayesCOOP::BayesCOOP(
+  data_train = data_train_bc,
+  family = "gaussian",
+  ss = c(0.05, 1),
+  group = TRUE,
+  bb = TRUE,
+  alpha_dirich = 1,
+  bbiters = 110,
+  bbburn = 10,
+  maxit = 100,
+  warning = TRUE,
+  verbose = FALSE,
+  control = list()
+)
+
+beta_hat <- unlist(fit_bc$beta_postmed)
+intercept_bc <- if ("(Intercept)" %in% names(beta_hat)) beta_hat["(Intercept)"] else 0
+beta_no_intercept <- beta_hat[setdiff(names(beta_hat), "(Intercept)")]
+
+Xtest_bc <- t(as.matrix(data_test_bc$feature_table))
+common_feats_bc <- intersect(colnames(Xtest_bc), names(beta_no_intercept))
+Xtest_use_bc <- Xtest_bc[, common_feats_bc, drop = FALSE]
+beta_use_bc <- beta_no_intercept[common_feats_bc]
+Xtest_centered <- scale(Xtest_use_bc, center = TRUE, scale = FALSE)
+
+bc_pred <- as.numeric(intercept_bc + Xtest_centered %*% beta_use_bc)
+mspe_bc <- mean((bc_pred - y_test_bc)^2, na.rm = TRUE)
+
+beta_med <- fit_bc$beta_postmed
+beta_samp <- fit_bc$beta_samples
+if (!is.null(beta_med)) beta_med <- unlist(beta_med)
+
+if (!is.null(beta_med) && !is.null(beta_samp) && (is.matrix(beta_samp) || is.data.frame(beta_samp))) {
+  bc_ci <- tibble(
+    feature = names(beta_med),
+    beta = as.numeric(beta_med),
+    lo = apply(beta_samp, 2, quantile, probs = 0.025, na.rm = TRUE),
+    hi = apply(beta_samp, 2, quantile, probs = 0.975, na.rm = TRUE)
+  )
+} else if (!is.null(beta_med)) {
+  bc_ci <- tibble(
+    feature = names(beta_med),
+    beta = as.numeric(beta_med),
+    lo = NA_real_,
+    hi = NA_real_
+  )
+} else {
+  bc_ci <- tibble(feature = character(), beta = numeric(), lo = numeric(), hi = numeric())
+}
+
+bc_coef_df <- bc_ci %>%
+  filter(feature != "(Intercept)", beta != 0) %>%
+  left_join(feature_lookup, by = "feature") %>%
+  arrange(beta)
+
+knitr::kable(
+  tibble(Method = "BayesCOOP (bb=TRUE)", MSPE = mspe_bc, Nonzero = nrow(bc_coef_df)),
+  digits = 4
+)
+```
+
+```{r}
+if (nrow(bc_coef_df) > 0) {
+  ggplot(bc_coef_df, aes(x = reorder(feature, beta), y = beta, fill = view)) +
+    geom_col() +
+    geom_errorbar(aes(ymin = lo, ymax = hi), width = 0.2) +
+    coord_flip() +
+    labs(
+      title = "BayesCOOP selected coefficients with 95% credible intervals",
+      x = NULL,
+      y = "Posterior median coefficient"
+    )
+}
+```
+
+BayesCOOP was successfully fitted and produced posterior coefficient estimates. However, because the package applies internal transformations and hierarchical shrinkage, the manually reconstructed out-of-sample predictions were unstable. Therefore, I interpret BayesCOOP mainly from an inference perspective rather than direct predictive performance.
+
+## 1(c) JAFAR
+
+```{r}
+scale_with_train <- function(x_train, x_test) {
+  mu <- colMeans(x_train)
+  sdv <- apply(x_train, 2, sd)
+  sdv[sdv == 0] <- 1
+  list(
+    train = scale(x_train, center = mu, scale = sdv),
+    test  = scale(x_test,  center = mu, scale = sdv)
+  )
+}
+
+scaled_views <- lapply(seq_along(xList_train), function(i) {
+  scale_with_train(xList_train[[i]], xList_test[[i]])
+})
+
+Xtrain_jafar <- lapply(scaled_views, `[[`, "train")
+Xtest_jafar  <- lapply(scaled_views, `[[`, "test")
+m <- length(Xtrain_jafar)
+y_train_center <- y_train - mean(y_train)
+
+fit_jafar <- gibbs_jafar(
+  Xtrain_jafar,
+  y = y_train_center,
+  K0 = 25,
+  K0_m = rep(20, m),
+  tMCMC = 10000,
+  tBurnIn = 5000,
+  tThin = 10
+)
+
+yhat_jafar_center <- predict_y(Xtest_jafar, fit_jafar)
+pred_center <- colMeans(yhat_jafar_center$mean)
+yhat_jafar <- as.numeric(pred_center) + mean(y_train)
+mspe_jafar <- mean((yhat_jafar - y_test)^2, na.rm = TRUE)
+
+knitr::kable(
+  tibble(Method = "JAFAR", MSPE = mspe_jafar),
+  digits = 4
+)
+```
+
+## 1(d) Summary comparison
+
+```{r}
+mspe_tbl_p1 <- tibble(
+  Method = c(
+    "IntegratedLearner (Late)",
+    "IntegratedLearner (Early)",
+    "multiview (Intermediate)",
+    "JAFAR",
+    "BayesCOOP (bb = TRUE)"
+  ),
+  MSPE = c(mspe_IL_late, mspe_IL_early, mspe_mv, mspe_jafar, NA_real_)
+)
+
+knitr::kable(mspe_tbl_p1, digits = 4)
+```
+
+```{r}
+mspe_tbl_p1_plot <- mspe_tbl_p1 %>%
+  filter(is.finite(MSPE), Method != "BayesCOOP (bb = TRUE)")
+
+barplot(
+  rev(mspe_tbl_p1_plot$MSPE),
+  names.arg = rev(mspe_tbl_p1_plot$Method),
+  horiz = TRUE,
+  las = 1,
+  main = "Problem 1: MSPE comparison",
+  xlab = "MSPE"
+)
+```
+
+Among all methods, the late integration approach achieved the lowest MSPE, indicating the best predictive performance. This suggests that combining information across omics layers at the model level is more effective than early concatenation or intermediate integration for this pregnancy prediction task.
+
+# Problem 2: Meta-analysis of cancer microbiome pathway data
+
+## 2(a) Load pathway abundance and prepare metadata
+
+```{r}
+se_pathway <- sampleMetadata |>
+  filter(study_name %in% c(
+    "FrankelAE_2017", "GopalakrishnanV_2018",
+    "LeeKA_2022", "MatsonV_2018",
+    "PetersBA_2019", "WindTT_2020"
+  )) |>
+  returnSamples("pathway_abundance", rownames = "short")
+
+data_meta <- select(as.data.frame(colData(se_pathway)), c("study_name", "ORR", "PFS12", "anti_PD_1"))
+data_meta$resvar <- NA
+
+data_meta$anti_PD_1[data_meta$anti_PD_1 == "responder"]     <- "yes"
+data_meta$anti_PD_1[data_meta$anti_PD_1 == "non_responder"] <- "no"
+data_meta$resvar[!is.na(data_meta$anti_PD_1)] <- data_meta$anti_PD_1[!is.na(data_meta$anti_PD_1)]
+data_meta$resvar[!is.na(data_meta$PFS12)]     <- data_meta$PFS12[!is.na(data_meta$PFS12)]
+data_meta$resvar[!is.na(data_meta$ORR)]       <- data_meta$ORR[!is.na(data_meta$ORR)]
+data_meta <- data_meta[!is.na(data_meta$resvar), c("study_name", "resvar")]
+data_meta$study_name <- factor(data_meta$study_name)
+
+data_path <- assay(se_pathway)
+data_path <- data_path[, colnames(data_path) %in% rownames(data_meta), drop = FALSE]
+
+data_path <- data_path[
+  !grepl("\\|", rownames(data_path)) &
+    !grepl("UNMAPPED|UNINTEGRATED", rownames(data_path), ignore.case = TRUE),
+  , drop = FALSE
+]
+
+data_path <- data_path / 100
+```
+
+## 2(b) Batch correction and PERMANOVA
+
+```{r}
+fit_adjust_path <- adjust_batch(
+  feature_abd = data_path,
+  batch = "study_name",
+  covariates = "resvar",
+  data = data_meta,
+  control = list(verbose = FALSE)
+)
+
+data_path_adj <- fit_adjust_path$feature_abd_adj
+
+D_before <- vegdist(t(data_path))
+D_after  <- vegdist(t(data_path_adj))
+
+set.seed(1)
+fit_adonis_before <- adonis2(D_before ~ study_name, data = data_meta)
+fit_adonis_after  <- adonis2(D_after  ~ study_name, data = data_meta)
+
+R2_before <- fit_adonis_before$R2[1]
+R2_after  <- fit_adonis_after$R2[1]
+
+knitr::kable(
+  tibble(
+    Stage = c("Before adjustment", "After adjustment"),
+    R2 = c(R2_before, R2_after)
+  ),
+  digits = 4
+)
+```
+
+```{r}
+pcoa_before <- cmdscale(D_before, eig = TRUE)
+pcoa_after  <- cmdscale(D_after, eig = TRUE)
+
+ord_before <- as.data.frame(pcoa_before$points)
+ord_after  <- as.data.frame(pcoa_after$points)
+colnames(ord_before) <- c("PC1", "PC2")
+colnames(ord_after)  <- c("PC1", "PC2")
+ord_before$Study <- data_meta$study_name
+ord_after$Study  <- data_meta$study_name
+
+pct_before <- round(pcoa_before$eig / sum(pcoa_before$eig) * 100, 1)[1:2]
+pct_after  <- round(pcoa_after$eig  / sum(pcoa_after$eig)  * 100, 1)[1:2]
+
+p_before <- ggplot(ord_before, aes(PC1, PC2, color = Study)) +
+  geom_point(size = 3) +
+  labs(
+    title = paste0("Before adjustment (PERMANOVA R2 = ", round(R2_before, 3), ")"),
+    x = paste0("Axis 1 (", pct_before[1], "%)"),
+    y = paste0("Axis 2 (", pct_before[2], "%)")
+  ) +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "none")
+
+p_after <- ggplot(ord_after, aes(PC1, PC2, color = Study)) +
+  geom_point(size = 3) +
+  labs(
+    title = paste0("After adjustment (PERMANOVA R2 = ", round(R2_after, 3), ")"),
+    x = paste0("Axis 1 (", pct_after[1], "%)"),
+    y = paste0("Axis 2 (", pct_after[2], "%)")
+  ) +
+  theme(plot.title = element_text(hjust = 0.5), legend.position = "none")
+
+plot_grid(p_before, p_after, ncol = 2)
+```
+
+The PCoA plots and PERMANOVA results quantify the extent of study-specific batch effects before and after adjustment. A lower post-adjustment R2 indicates that MMUPHin reduced unwanted study-level variation while preserving the biological signal of interest.
+
+## 2(c) Meta-analytic differential abundance testing
+
+```{r}
+fit_meta_path <- lm_meta(
+  feature_abd = data_path_adj,
+  batch = "study_name",
+  data = data_meta,
+  exposure = "resvar",
+  control = list(
+    analysis_method = "CPLM",
+    transform = "NONE"
+  )
+)
+#install.packages(c("cli", "tibble", "pillar", "dplyr", "ggplot2"))
+#library(cli)
+
+#remove.packages("cli")
+#install.packages("cli")
+#install.packages(c("tibble", "pillar", "dplyr", "ggplot2"))
+
+res_meta_path <- fit_meta_path$meta_fits
+
+#sig_path <- as_tibble(res_meta_path) %>%
+#  filter(qval.fdr < 0.05) %>%
+#  arrange(desc(abs(coef)))
+#
+#knitr::kable(head(sig_path, 20), digits = 4)
+
+nom_path <- res_meta_path %>%
+  filter(pval < 0.05) %>%
+  arrange(desc(abs(coef)))
+
+knitr::kable(head(nom_path, 20), digits = 4)
+```
+
+```{r}
+plot_path <- nom_path %>%
+  slice_max(order_by = abs(coef), n = 20)
+
+ggplot(plot_path, aes(x = reorder(feature, coef), y = coef)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Significant pathways from MMUPHin meta-analysis",
+    x = NULL,
+    y = "Meta-analytic coefficient"
+  )
+```
+
+
+
+# Problem 3: Diagonal Integration of iHMP Data (IBD vs. Non-IBD)
+
+## 3(a) Load iHMP data and create binary outcome
+
+```{r p3a-load}
+se_species <- sampleMetadata |>
+  dplyr::filter(study_name == "HMP_2019_ibdmdb") |>
+  returnSamples("relative_abundance", rownames = "short")
+
+se_pathway <- sampleMetadata |>
+  dplyr::filter(study_name == "HMP_2019_ibdmdb") |>
+  returnSamples("pathway_abundance", rownames = "short")
+
+meta_sp <- as.data.frame(colData(se_species))
+meta_pw <- as.data.frame(colData(se_pathway))
+
+common_samples <- intersect(rownames(meta_sp), rownames(meta_pw))
+meta <- meta_sp[common_samples, , drop = FALSE]
+
+subject_col <- intersect(c("subject_id", "subjectID"), colnames(meta))[1]
+if (is.na(subject_col)) stop("No subject ID column found.")
+
+meta <- meta |>
+  dplyr::mutate(
+    disease_bin = ifelse(disease %in% c("CD", "UC"), "IBD", "nonIBD"),
+    disease_bin = factor(disease_bin, levels = c("nonIBD", "IBD"))
+  )
+
+sp_mat <- assay(se_species)[, common_samples, drop = FALSE] / 100
+
+pw_mat <- assay(se_pathway)[, common_samples, drop = FALSE] / 100
+pw_mat <- pw_mat[
+  !grepl("\\|", rownames(pw_mat)) &
+  !grepl("UNMAPPED|UNINTEGRATED", rownames(pw_mat), ignore.case = TRUE),
+  , drop = FALSE
+]
+
+filter_features <- function(mat, prev_thresh = 0.1) {
+  x    <- t(mat)
+  keep <- colMeans(x > 0) > prev_thresh
+  x    <- x[, keep, drop = FALSE]
+  nzv  <- caret::nearZeroVar(x)
+  if (length(nzv) > 0) x <- x[, -nzv, drop = FALSE]
+  as.matrix(x)
+}
+
+sp_x <- filter_features(sp_mat)
+pw_x <- filter_features(pw_mat)
+
+meta_use    <- meta[rownames(sp_x), , drop = FALSE]
+meta_pw_use <- meta[rownames(pw_x), , drop = FALSE]
+
+knitr::kable(
+  tibble(
+    Layer      = c("Species", "Pathways"),
+    n_samples  = c(nrow(sp_x), nrow(pw_x)),
+    n_features = c(ncol(sp_x), ncol(pw_x))
+  ),
+  caption = "Feature dimensions after filtering"
+)
+```
+
+## 3(b) Run MaAsLin2 and extract subject-level random effects
+
+```{r p3b-maaslin, results="hide"}
+dir.create("maaslin_sp_p3", showWarnings = FALSE)
+dir.create("maaslin_pw_p3", showWarnings = FALSE)
+
+fit_sp <- Maaslin2(
+  input_data      = sp_x,
+  input_metadata  = meta_use,
+  output          = "maaslin_sp_p3",
+  normalization   = "NONE",
+  transform       = "LOG",
+  fixed_effects   = "disease_bin",
+  random_effects  = subject_col,
+  analysis_method = "LM"
+)
+
+fit_pw <- Maaslin2(
+  input_data      = pw_x,
+  input_metadata  = meta_pw_use,
+  output          = "maaslin_pw_p3",
+  normalization   = "NONE",
+  transform       = "LOG",
+  fixed_effects   = "disease_bin",
+  random_effects  = subject_col,
+  analysis_method = "LM"
+)
+```
+
+```{r p3b-extract-re}
+
+extract_RE_intercept <- function(X, meta, subj_col) {
+  meta <- meta[rownames(X), , drop = FALSE]
+  form <- as.formula(paste0("y ~ 1 + (1|", subj_col, ")"))
+
+  re_list <- lapply(colnames(X), function(feat) {
+    dat   <- meta
+    dat$y <- log(X[, feat] + 1e-5)
+    if (var(dat$y) < 1e-10) return(NULL)
+
+    mod <- tryCatch(
+      suppressWarnings(
+        lme4::lmer(form, data = dat, REML = TRUE,
+                   control = lme4::lmerControl(optimizer = "bobyqa"))
+      ),
+      error = function(e) NULL
+    )
+    if (is.null(mod)) return(NULL)
+
+    re <- tryCatch(lme4::ranef(mod)[[subj_col]], error = function(e) NULL)
+    if (is.null(re) || nrow(re) == 0) return(NULL)
+
+    tibble(
+      subject = rownames(re),
+      feature = feat,
+      value   = as.numeric(re[, "(Intercept)"])
+    )
+  })
+
+  out <- dplyr::bind_rows(re_list)
+  if (nrow(out) == 0) stop("No random effects extracted.")
+
+  out |>
+    tidyr::pivot_wider(names_from  = feature,
+                       values_from = value,
+                       values_fill = 0) |>
+    tibble::column_to_rownames("subject") |>
+    as.matrix()
+}
+
+sp_RE <- extract_RE_intercept(sp_x, meta_use,    subject_col)
+pw_RE <- extract_RE_intercept(pw_x, meta_pw_use,  subject_col)
+
+## Drop zero-variance columns
+sp_RE <- sp_RE[, apply(sp_RE, 2, var) > 0, drop = FALSE]
+pw_RE <- pw_RE[, apply(pw_RE, 2, var) > 0, drop = FALSE]
+
+## Subject-level outcome (one label per subject)
+y_subj_df <- meta_use |>
+  dplyr::select(subject = all_of(subject_col), disease_bin) |>
+  dplyr::distinct(subject, .keep_all = TRUE) |>
+  dplyr::arrange(subject)
+
+common_subj <- Reduce(intersect,
+                      list(rownames(sp_RE), rownames(pw_RE),
+                           y_subj_df$subject))
+
+sp_RE     <- sp_RE[common_subj, , drop = FALSE]
+pw_RE     <- pw_RE[common_subj, , drop = FALSE]
+y_subj_df <- y_subj_df |>
+  dplyr::filter(subject %in% common_subj) |>
+  dplyr::arrange(subject)
+
+y_subj <- ifelse(y_subj_df$disease_bin == "IBD", 1, 0)
+names(y_subj) <- y_subj_df$subject
+
+table(y_subj)
+
+set.seed(123)
+folds <- caret::createFolds(
+  factor(y_subj, levels = c(0, 1), labels = c("nonIBD", "IBD")),
+  k = 5,
+  list = TRUE,
+  returnTrain = FALSE
+)
+
+
+knitr::kable(
+  tibble(
+    View       = c("Species RE", "Pathway RE"),
+    n_subjects = c(nrow(sp_RE), nrow(pw_RE)),
+    n_features = c(ncol(sp_RE), ncol(pw_RE))
+  ),
+  caption = "Subject-level random effect matrix dimensions"
+)
+```
+
+## 3(c) IntegratedLearner on subject-level random effects (5-fold CV)
+
+```{r p3-setup}
+#
+#
+```
+
+
+
+
+
+---
+
+# Problem 4: MOFA+ Factors to Supervised Prediction
+
+## Setup: preprocess pregnancy data
+
+```{r p4-setup}
+
+base_url <- paste0("https://raw.githubusercontent.com/",
+                   "himelmallick/IntegratedLearner/master/data/")
+
+data_train_raw <- get(load(url(paste0(base_url, "StelzerDOS.RData"))))
+data_test_raw  <- get(load(url(paste0(base_url, "StelzerDOS_valid.RData"))))
+
+data_train_raw$feature_metadata <- data_train_raw$feature_metadata |>
+  dplyr::filter(featureType != "Metabolomics")
+data_train_raw$feature_table <- data_train_raw$feature_table[
+  rownames(data_train_raw$feature_metadata), , drop = FALSE]
+
+pos_tr <- grep("A",  colnames(data_train_raw$feature_table), ignore.case = TRUE)
+data_train_raw$feature_table   <- data_train_raw$feature_table[, pos_tr, drop = FALSE]
+data_train_raw$sample_metadata <- data_train_raw$sample_metadata[pos_tr, , drop = FALSE]
+
+pos_te <- grep("G1", colnames(data_test_raw$feature_table))
+data_test_raw$feature_table   <- data_test_raw$feature_table[, pos_te, drop = FALSE]
+data_test_raw$sample_metadata <- data_test_raw$sample_metadata[pos_te, , drop = FALSE]
+
+gen_datalist <- function(dat) {
+  views <- unique(dat$feature_metadata$featureType)
+  xList <- lapply(views, function(v) {
+    feats <- rownames(dat$feature_metadata)[dat$feature_metadata$featureType == v]
+    as.data.frame(t(dat$feature_table[feats, , drop = FALSE]))
+  })
+  names(xList) <- views
+  y <- dat$sample_metadata[, 1]
+  if (is.data.frame(y)) y <- y[[1]]
+  list(xList = xList, y = y)
+}
+
+filter_feats <- function(x, abd = 0, prev = 0.1) {
+  keep <- colSums(x > abd) > nrow(x) * prev
+  x    <- x[, keep, drop = FALSE]
+  nzv  <- caret::nearZeroVar(x)
+  if (length(nzv) > 0) x <- x[, -nzv, drop = FALSE]
+  x
+}
+
+reconstruct_IL <- function(xList, y) {
+  ft    <- as.data.frame(do.call(rbind,
+             lapply(xList, function(x) t(as.data.frame(x)))))
+  fmeta <- data.frame(featureID   = rownames(ft),
+                      featureType = rep(names(xList), sapply(xList, ncol)),
+                      stringsAsFactors = FALSE)
+  rownames(fmeta) <- fmeta$featureID
+  smeta <- data.frame(Y = as.numeric(y), subjectID = colnames(ft),
+                      stringsAsFactors = FALSE)
+  rownames(smeta) <- smeta$subjectID
+  list(feature_table = ft, feature_metadata = fmeta, sample_metadata = smeta)
+}
+
+dl_tr <- gen_datalist(data_train_raw)
+dl_te <- gen_datalist(data_test_raw)
+xList_tr <- lapply(dl_tr$xList, filter_feats)
+xList_te <- lapply(dl_te$xList, filter_feats)
+y_tr <- dl_tr$y
+y_te <- dl_te$y
+
+for (i in seq_along(xList_tr)) {
+  cf <- intersect(colnames(xList_tr[[i]]), colnames(xList_te[[i]]))
+  xList_tr[[i]] <- as.matrix(xList_tr[[i]][, cf, drop = FALSE])
+  xList_te[[i]] <- as.matrix(xList_te[[i]][, cf, drop = FALSE])
+}
+
+data_tr_proc <- reconstruct_IL(xList_tr, y_tr)
+data_te_proc <- reconstruct_IL(xList_te, y_te)
+
+cat("Train: features =", nrow(data_tr_proc$feature_table),
+    "| subjects =", ncol(data_tr_proc$feature_table), "\n")
+cat("Test : features =", nrow(data_te_proc$feature_table),
+    "| subjects =", ncol(data_te_proc$feature_table), "\n")
+```
+
+## 4(a) Train MOFA+ on pregnancy training data
+
+```{r p4a-mofa}
+mofa_input <- list(CYTOF      = t(xList_tr$CYTOF),
+                   Proteomics = t(xList_tr$Proteomics))
+
+mofa_obj   <- MOFA2::create_mofa(mofa_input)
+data_opts  <- MOFA2::get_default_data_options(mofa_obj)
+model_opts <- MOFA2::get_default_model_options(mofa_obj)
+train_opts <- MOFA2::get_default_training_options(mofa_obj)
+
+model_opts$num_factors      <- 10
+train_opts$seed             <- 123
+train_opts$convergence_mode <- "slow"
+train_opts$verbose          <- FALSE
+
+mofa_obj <- MOFA2::prepare_mofa(object = mofa_obj,
+                                data_options     = data_opts,
+                                model_options    = model_opts,
+                                training_options = train_opts)
+
+mofa_fit <- MOFA2::run_mofa(mofa_obj, use_basilisk = TRUE)
+
+factors_train <- MOFA2::get_factors(mofa_fit, factors = "all")[[1]]
+cat("MOFA factor matrix (train): subjects =", nrow(factors_train),
+    "| factors =", ncol(factors_train), "\n")
+
+MOFA2::plot_variance_explained(mofa_fit, plot_total = TRUE)
+```
+
+## 4(b) Project train and test into factor space per view
+
+```{r p4b-project}
+weights  <- MOFA2::get_weights(mofa_fit,
+                               views = c("CYTOF", "Proteomics"),
+                               factors = "all")
+W_cytof  <- weights$CYTOF
+W_prot   <- weights$Proteomics
+
+Ztrain_cytof <- xList_tr$CYTOF      %*% W_cytof
+Ztrain_prot  <- xList_tr$Proteomics %*% W_prot
+Ztest_cytof  <- xList_te$CYTOF      %*% W_cytof
+Ztest_prot   <- xList_te$Proteomics %*% W_prot
+
+knitr::kable(
+  tibble(View     = c("CYTOF train","Proteomics train","CYTOF test","Proteomics test"),
+         Subjects = c(nrow(Ztrain_cytof),nrow(Ztrain_prot),
+                      nrow(Ztest_cytof), nrow(Ztest_prot)),
+         Factors  = c(ncol(Ztrain_cytof),ncol(Ztrain_prot),
+                      ncol(Ztest_cytof), ncol(Ztest_prot))),
+  caption = "Dimension of MOFA factor-score matrices"
+)
+```
+
+## 4(c) IntegratedLearner on MOFA factor scores
+
+```{r p4c-IL-mofa}
+data_mofa_tr <- reconstruct_IL(list(CYTOF = Ztrain_cytof, Proteomics = Ztrain_prot), y_tr)
+data_mofa_te <- reconstruct_IL(list(CYTOF = Ztest_cytof,  Proteomics = Ztest_prot),  y_te)
+
+fit_IL_mofa <- IntegratedLearner(
+  PCL_train     = data_mofa_tr,  PCL_valid     = data_mofa_te,
+  folds         = 5,             seed          = 123,
+  base_learner  = "SL.randomForest",
+  base_screener = "All",         meta_learner  = "SL.nnls.auc",
+  run_concat    = TRUE,          run_stacked   = TRUE,
+  verbose       = FALSE,         print_learner = FALSE,
+  refit.stack   = TRUE,          family        = gaussian()
+)
+
+mspe_mofa_early <- mean((fit_IL_mofa$yhat.test$concatenated - y_te)^2, na.rm = TRUE)
+mspe_mofa_late  <- mean((fit_IL_mofa$yhat.test$stacked       - y_te)^2, na.rm = TRUE)
+
+knitr::kable(
+  tibble(Method = c("MOFA + IL (Early fusion)", "MOFA + IL (Late fusion)"),
+         MSPE   = round(c(mspe_mofa_early, mspe_mofa_late), 4)),
+  caption = "Test-set MSPE for MOFA-based IntegratedLearner"
+)
+```
+
+## 4(d) Full MSPE comparison
+
+```{r p4d-comparison}
+fit_IL_raw <- IntegratedLearner(
+  PCL_train     = data_tr_proc,  PCL_valid     = data_te_proc,
+  folds         = 5,             seed          = 123,
+  base_learner  = "SL.randomForest",
+  base_screener = "All",         meta_learner  = "SL.nnls.auc",
+  run_concat    = TRUE,          run_stacked   = TRUE,
+  verbose       = FALSE,         print_learner = FALSE,
+  refit.stack   = TRUE,          family        = gaussian()
+)
+
+mspe_IL_early_raw <- mean((fit_IL_raw$yhat.test$concatenated - y_te)^2, na.rm = TRUE)
+mspe_IL_late_raw  <- mean((fit_IL_raw$yhat.test$stacked       - y_te)^2, na.rm = TRUE)
+
+mspe_all <- tibble(
+  Method = c(
+    "IntegratedLearner – Early (raw)",
+    "IntegratedLearner – Late (raw)",
+    "multiview – Intermediate",     # replace NA with mspe_mv from P1(a)
+    "JAFAR",                        # replace NA with mspe_jafar from P1(c)
+    "MOFA + IL – Early",
+    "MOFA + IL – Late"
+  ),
+  MSPE = c(mspe_IL_early_raw, mspe_IL_late_raw,
+           NA_real_, NA_real_,
+           mspe_mofa_early, mspe_mofa_late)
+) |> dplyr::arrange(MSPE)
+
+knitr::kable(mspe_all, digits = 4,
+             caption = "Full MSPE comparison: raw features vs. MOFA factors")
+```
+
+```{r p4d-barplot}
+plot_df <- mspe_all |>
+  dplyr::filter(is.finite(MSPE)) |>
+  dplyr::mutate(Method = factor(Method, levels = rev(Method)),
+                Type   = ifelse(grepl("MOFA", Method),
+                                "MOFA factors", "Raw features"))
+
+ggplot(plot_df, aes(x = MSPE, y = Method, fill = Type)) +
+  geom_col(width = 0.6) +
+  scale_fill_manual(values = c("Raw features" = "steelblue",
+                               "MOFA factors" = "tomato")) +
+  labs(title = "Problem 4 – MSPE: raw features vs. MOFA factor scores",
+       x = "MSPE (lower is better)", y = NULL, fill = NULL) +
+  theme(legend.position = "bottom")
+```
